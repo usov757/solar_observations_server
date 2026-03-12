@@ -21,9 +21,38 @@ defmodule SolarObservationsWeb.Router do
   end
 
   # Other scopes may use custom stacks.
-  # scope "/api", SolarObservationsWeb do
-  #   pipe_through :api
-  # end
+  scope "/api", SolarObservationsWeb do
+    pipe_through :api
+
+    # Mounts
+    resources "/mounts", MountController, except: [:new, :edit] do
+      get "/status", MountController, :status
+      post "/goto_sun", MountController, :goto_sun
+      post "/start_tracking", MountController, :start_tracking
+      post "/stop_tracking", MountController, :stop_tracking
+      post "/sync", MountController, :sync
+      get "/sun_position", MountController, :sun_position
+      post "/initialize", MountController, :initialize
+      get "/axis_status", MountController, :axis_status
+      get "/position", MountController, :position
+      post "/stop", MountController, :stop
+      get "/cameras", CameraController, :by_mount
+      get "/observing_sessions", ObservingSessionController, :by_mount
+    end
+
+    # Cameras
+    resources "/cameras", CameraController, except: [:new, :edit]
+
+    # Observing sessions
+    resources "/observing_sessions", ObservingSessionController, except: [:new, :edit] do
+      post "/end", ObservingSessionController, :end_session
+      post "/abort", ObservingSessionController, :abort
+      get "/session_events", SessionEventController, :by_session
+    end
+
+    # Session events
+    resources "/session_events", SessionEventController, except: [:new, :edit]
+  end
 
   # Enable LiveDashboard and Swoosh mailbox preview in development
   if Application.compile_env(:solar_observations, :dev_routes) do
