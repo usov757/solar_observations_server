@@ -1,196 +1,203 @@
-defmodule SolarObservations.Workers.MountWorker do
+defmodule SolarObservations.Workers.Mount.MountWorker do
   @moduledoc """
   GenServer для управления экваториальной монтировкой SkyWatcher через UART.
 
-  Отвечает только за:
-    - UART соединение и очередь команд
-    - Публичный API (команды к контроллеру)
-    - State machine: reconnect, таймауты, Dec коррекция
-
-  Математика → Workers.Utils.Pointing
-  Протокол   → Workers.Utils.Protocol
+  Особенности:
+    - При старте не требует наличия активной монтировки; ждёт появления в БД.
+    - Периодически проверяет наличие/смену активной монтировки и переподключается.
+    - Координаты монтировки (широта, долгота) берутся из активной записи.
   """
 
   use GenServer
   import Bitwise
   require Logger
 
-  alias SolarObservations.Workers.Utils.Protocol
-  alias SolarObservations.Workers.Utils.Pointing
+  alias SolarObservations.Repo
+  alias SolarObservations.Mount
+  alias SolarObservations.Workers.Mount.Utils.Protocol
+  alias SolarObservations.Workers.Mount.Utils.Pointing
 
   @response_timeout        10_000
   @ping_command            ":e1\r"
   @dec_correction_interval 30 * 60 * 1_000
-
-  # Максимум одного GOTO в шагах — 24-bit знаковый предел протокола SkyWatcher.
-  # encode_position(steps) = steps + 0x800000, должно влезать в 24 бита.
-  # 0x7FFFFF = 8_388_607 шагов ≈ 334° при CPR=9_024_000.
-  # Используем 330° (~8_269_333 шагов) как безопасный потолок чанка.
-  @chunk_degrees        330.0
-  @stable_ticks_required  3
+  @chunk_degrees           330.0
+  @stable_ticks_required   3
+  @mount_check_interval    10_000   # как часто проверять активную монтировку (мс)
 
   # ===========================================================================
   # Public API
   # ===========================================================================
 
-  @spec start_link(keyword()) :: :ignore | {:error, any()} | {:ok, pid()}
-  def start_link(opts) do
-    port_name          = Keyword.fetch!(opts, :port_name)
-    baud_rate          = Keyword.get(opts, :baud_rate, 9600)
+  def start_link(opts \\ []) do
     reconnect_interval = Keyword.get(opts, :reconnect_interval, 5_000)
-    GenServer.start_link(__MODULE__, {port_name, baud_rate, reconnect_interval}, name: __MODULE__)
+    GenServer.start_link(__MODULE__, %{reconnect_interval: reconnect_interval}, name: __MODULE__)
   end
 
-  def child_spec(opts),
-    do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, shutdown: 35_000, type: :worker}
+  def child_spec(opts) do
+    %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, shutdown: 35_000, type: :worker}
+  end
 
-  def initialize(channel \\ "3", timeout \\ @response_timeout)
-      when channel in ["1", "2", "3"] do
-    case send_command(":F#{channel}\r", timeout) do
-      {:ok, _} -> :ok
-      error    -> error
+  # Все публичные команды (кроме reload_mount/get_active_mount) должны быть обёрнуты
+  # в with_mount/1, который проверяет наличие активной монтировки.
+  defp with_mount(fun) do
+    case GenServer.call(__MODULE__, :is_mount_ready) do
+      true -> fun.()
+      false -> {:error, :no_active_mount}
     end
   end
 
-  def get_version(channel, timeout \\ @response_timeout) when channel in ["1", "2"],
-    do: send_command(":e#{channel}\r", timeout)
+  # --- Команды монтировки (требуют активной монтировки) ---
+  def initialize(channel \\ "3", timeout \\ @response_timeout) when channel in ["1", "2", "3"] do
+    with_mount(fn -> send_command(":F#{channel}\r", timeout) end)
+  end
+
+  def get_version(channel, timeout \\ @response_timeout) when channel in ["1", "2"] do
+    with_mount(fn -> send_command(":e#{channel}\r", timeout) end)
+  end
 
   def get_status(channel, timeout \\ @response_timeout) when channel in ["1", "2"] do
-    case send_command(":f#{channel}\r", timeout) do
-      {:ok, response} -> Protocol.parse_status(response)
-      error           -> error
-    end
+    with_mount(fn ->
+      case send_command(":f#{channel}\r", timeout) do
+        {:ok, response} -> Protocol.parse_status(response)
+        error -> error
+      end
+    end)
   end
 
   def get_position(channel, timeout \\ @response_timeout) when channel in ["1", "2"] do
-    case send_command(":j#{channel}\r", timeout) do
-      {:ok, response} -> Protocol.parse_position(response)
-      error           -> error
-    end
+    with_mount(fn ->
+      case send_command(":j#{channel}\r", timeout) do
+        {:ok, response} -> Protocol.parse_position(response)
+        error -> error
+      end
+    end)
   end
 
   def start_motion(channel, timeout \\ @response_timeout) when channel in ["1", "2", "3"] do
-    case send_command(":J#{channel}\r", timeout) do
-      {:ok, _} -> :ok
-      error    -> error
-    end
+    with_mount(fn -> send_command(":J#{channel}\r", timeout) end)
   end
 
   def stop_motion(channel, timeout \\ @response_timeout) when channel in ["1", "2", "3"] do
-    case send_command(":K#{channel}\r", timeout) do
-      {:ok, _}           -> :ok
-      {:error, :timeout} -> Logger.warning("Stop command timeout"); :ok
-      error              -> error
-    end
+    with_mount(fn ->
+      case send_command(":K#{channel}\r", timeout) do
+        {:ok, _} -> :ok
+        {:error, :timeout} -> Logger.warning("Stop command timeout"); :ok
+        error -> error
+      end
+    end)
   end
 
   def instant_stop(channel, timeout \\ @response_timeout) when channel in ["1", "2", "3"] do
-    case send_command(":L#{channel}\r", timeout) do
-      {:ok, _} -> :ok
-      error    -> error
-    end
+    with_mount(fn -> send_command(":L#{channel}\r", timeout) end)
   end
 
   def set_motion_mode(channel, db1, db2, timeout \\ @response_timeout) when channel in ["1", "2"] do
-    d1 = Integer.to_string(db1 &&& 0xF, 16)
-    d2 = Integer.to_string(db2 &&& 0xF, 16)
-    case send_command(":G#{channel}#{d1}#{d2}\r", timeout) do
-      {:ok, _} -> :ok
-      error    -> error
-    end
+    with_mount(fn ->
+      d1 = Integer.to_string(db1 &&& 0xF, 16)
+      d2 = Integer.to_string(db2 &&& 0xF, 16)
+      send_command(":G#{channel}#{d1}#{d2}\r", timeout)
+    end)
   end
 
   def set_goto_target(channel, position, timeout \\ @response_timeout) when channel in ["1", "2"] do
-    case send_command(":S#{channel}#{Protocol.encode_position(position)}\r", timeout) do
-      {:ok, _} -> :ok
-      error    -> error
-    end
+    with_mount(fn -> send_command(":S#{channel}#{Protocol.encode_position(position)}\r", timeout) end)
   end
 
   def set_step_period(channel, period, timeout \\ @response_timeout) when channel in ["1", "2"] do
-    case send_command(":I#{channel}#{Protocol.encode_24bit(period)}\r", timeout) do
-      {:ok, _} -> :ok
-      error    -> error
-    end
+    with_mount(fn -> send_command(":I#{channel}#{Protocol.encode_24bit(period)}\r", timeout) end)
   end
 
   def get_cpr(channel, timeout \\ @response_timeout) when channel in ["1", "2"] do
-    case send_command(":a#{channel}\r", timeout) do
-      {:ok, response} -> Protocol.parse_24bit(response)
-      error           -> error
-    end
+    with_mount(fn ->
+      case send_command(":a#{channel}\r", timeout) do
+        {:ok, response} -> Protocol.parse_24bit(response)
+        error -> error
+      end
+    end)
   end
 
   def get_timer_freq(timeout \\ @response_timeout) do
-    case send_command(":b1\r", timeout) do
-      {:ok, response} -> Protocol.parse_24bit(response)
-      error           -> error
-    end
+    with_mount(fn ->
+      case send_command(":b1\r", timeout) do
+        {:ok, response} -> Protocol.parse_24bit(response)
+        error -> error
+      end
+    end)
   end
 
   def get_high_speed_ratio(channel, timeout \\ @response_timeout) when channel in ["1", "2"] do
-    case send_command(":g#{channel}\r", timeout) do
-      {:ok, response} -> Protocol.parse_8bit(response)
-      error           -> error
-    end
+    with_mount(fn ->
+      case send_command(":g#{channel}\r", timeout) do
+        {:ok, response} -> Protocol.parse_8bit(response)
+        error -> error
+      end
+    end)
   end
 
   def set_sleep(channel, sleep, timeout \\ @response_timeout) when channel in ["1", "2", "3"] do
     mode = if sleep, do: "1", else: "0"
-    case send_command(":B#{channel}#{mode}\r", timeout) do
-      {:ok, _} -> :ok
-      error    -> error
-    end
+    with_mount(fn -> send_command(":B#{channel}#{mode}\r", timeout) end)
   end
 
   def get_all_statuses(timeout \\ @response_timeout) do
-    with {:ok, s1} <- get_status("1", timeout),
-         {:ok, s2} <- get_status("2", timeout) do
-      {:ok, %{axis1: s1, axis2: s2}}
-    end
+    with_mount(fn ->
+      with {:ok, s1} <- get_status("1", timeout),
+           {:ok, s2} <- get_status("2", timeout) do
+        {:ok, %{axis1: s1, axis2: s2}}
+      end
+    end)
   end
 
   def ping(timeout \\ 3_000) do
-    case get_version("1", timeout) do
-      {:ok, _}         -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+    with_mount(fn -> get_version("1", timeout) end)
   end
 
   def check_connection(timeout \\ @response_timeout) do
-    with {:ok, version}  <- get_version("1", timeout),
-         {:ok, statuses} <- get_all_statuses(timeout),
-         {:ok, pos1}     <- get_position("1", timeout),
-         {:ok, pos2}     <- get_position("2", timeout) do
-      {:ok, %{
-        connected:      true,
-        version:        version,
-        axis1_status:   statuses.axis1,
-        axis2_status:   statuses.axis2,
-        axis1_position: pos1,
-        axis2_position: pos2,
-        timestamp:      DateTime.utc_now()
-      }}
-    else
-      {:error, :timeout}       -> {:error, :mount_not_responding}
-      {:error, :not_connected} -> {:error, :worker_not_connected}
-      {:error, reason}         -> {:error, reason}
-    end
+    with_mount(fn ->
+      with {:ok, version}  <- get_version("1", timeout),
+           {:ok, statuses} <- get_all_statuses(timeout),
+           {:ok, pos1}     <- get_position("1", timeout),
+           {:ok, pos2}     <- get_position("2", timeout) do
+        {:ok, %{
+          connected:      true,
+          version:        version,
+          axis1_status:   statuses.axis1,
+          axis2_status:   statuses.axis2,
+          axis1_position: pos1,
+          axis2_position: pos2,
+          timestamp:      DateTime.utc_now()
+        }}
+      else
+        {:error, :timeout}       -> {:error, :mount_not_responding}
+        {:error, :not_connected} -> {:error, :worker_not_connected}
+        {:error, reason}         -> {:error, reason}
+      end
+    end)
   end
 
   def is_motor_moving?(channel, interval_ms \\ 500) do
-    with {:ok, pos1} <- get_position(channel) do
-      Process.sleep(interval_ms)
-      with {:ok, pos2} <- get_position(channel) do
-        {:ok, abs(pos2 - pos1) > 2}
+    with_mount(fn ->
+      with {:ok, pos1} <- get_position(channel) do
+        Process.sleep(interval_ms)
+        with {:ok, pos2} <- get_position(channel) do
+          {:ok, abs(pos2 - pos1) > 2}
+        end
       end
-    end
+    end)
   end
 
+  # --- Позиция Солнца (использует координаты активной монтировки) ---
   def get_sun_position do
-    lat = Application.get_env(:solar_observations, :observer_latitude)
-    lon = Application.get_env(:solar_observations, :observer_longitude)
-    {:ok, Pointing.calculate_sun_position(DateTime.utc_now(), lat, lon)}
+    GenServer.call(__MODULE__, :get_sun_position, 5_000)
+  end
+
+  # --- Управление активной монтировкой ---
+  def reload_mount do
+    GenServer.cast(__MODULE__, :reload_mount)
+  end
+
+  def get_active_mount do
+    GenServer.call(__MODULE__, :get_active_mount)
   end
 
   # ---------------------------------------------------------------------------
@@ -322,19 +329,17 @@ defmodule SolarObservations.Workers.MountWorker do
   # ===========================================================================
 
   @impl true
-  def init({port_name, baud_rate, reconnect_interval}) do
-    Logger.info("Starting MountWorker on #{port_name} at #{baud_rate} baud")
+  def init(%{reconnect_interval: reconnect_interval}) do
     Process.flag(:trap_exit, true)
     {:ok, uart_pid} = Circuits.UART.start_link()
     Process.monitor(uart_pid)
     Circuits.UART.configure(uart_pid, active: true)
-    send(self(), :connect)
 
-    {:ok, %{
+    state = %{
       uart_pid:                  uart_pid,
       connected:                 false,
-      port_name:                 port_name,
-      baud_rate:                 baud_rate,
+      port_name:                 nil,
+      baud_rate:                 nil,
       reconnect_interval:        reconnect_interval,
       request_queue:             [],
       current_request:           nil,
@@ -351,16 +356,23 @@ defmodule SolarObservations.Workers.MountWorker do
       last_cpr:                  nil,
       last_tmr_freq:             nil,
       mount_initialized:         false,
-      # Текущая активность — восстанавливается после reconnect+init
-      # nil | {:tracking, cpr, tmr_freq} | {:goto_sun, timeout}
-      active_activity:           nil
-    }}
+      active_activity:           nil,
+      # Новые поля
+      active_mount_id:           nil,
+      latitude:                  nil,
+      longitude:                 nil,
+      status:                    :waiting_for_mount,  # :waiting_for_mount | :connecting | :connected
+      mount_check_timer:         nil
+    }
+
+    schedule_mount_check()
+    Logger.info("MountWorker started. Waiting for active mount...")
+    {:ok, state}
   end
 
   @impl true
   def terminate(reason, state) do
     Logger.warning("MountWorker terminating: #{inspect(reason)}")
-
     if state.connected do
       if state.dec_correction_ref, do: Process.cancel_timer(state.dec_correction_ref)
       Circuits.UART.write(state.uart_pid, ":L3\r")
@@ -372,12 +384,11 @@ defmodule SolarObservations.Workers.MountWorker do
       Circuits.UART.close(state.uart_pid)
       Logger.info("✓ Mount at HOME, UART closed")
     end
-
     :ok
   end
 
   # ===========================================================================
-  # GenServer: call / cast
+  # GenServer: call / cast (все handle_call сгруппированы здесь)
   # ===========================================================================
 
   @impl true
@@ -390,6 +401,35 @@ defmodule SolarObservations.Workers.MountWorker do
   def handle_call(:get_state, _from, state),
     do: {:reply, state, state}
 
+  # Новые клаузы для активной монтировки и позиции Солнца
+  def handle_call(:is_mount_ready, _from, state) do
+    ready = state.status == :connected and state.mount_initialized
+    {:reply, ready, state}
+  end
+
+  def handle_call(:get_sun_position, _from, state) do
+    case {state.status, state.latitude, state.longitude} do
+      {:connected, lat, lon} when not is_nil(lat) and not is_nil(lon) ->
+        now = DateTime.utc_now()
+        lat_float = Decimal.to_float(lat)
+        lon_float = Decimal.to_float(lon)
+        result = Pointing.calculate_sun_position(now, lat_float, lon_float)
+        {:reply, {:ok, result}, state}
+      _ ->
+        {:reply, {:error, :mount_not_ready}, state}
+    end
+  end
+
+  def handle_call(:get_active_mount, _from, state) do
+    if state.active_mount_id do
+      mount = Repo.get(Mount, state.active_mount_id)
+      {:reply, {:ok, mount}, state}
+    else
+      {:reply, {:error, :no_active_mount}, state}
+    end
+  end
+
+  # Casts
   @impl true
   def handle_cast({:set_calibration, cal}, state),
     do: {:noreply, %{state | calibration: cal}}
@@ -409,11 +449,21 @@ defmodule SolarObservations.Workers.MountWorker do
     {:noreply, %{state | active_activity: activity}}
   end
 
+  def handle_cast(:reload_mount, state) do
+    send(self(), :check_active_mount)
+    {:noreply, state}
+  end
+
   # ===========================================================================
   # GenServer: info
   # ===========================================================================
 
-  @impl true
+  # Обработчик connect – сначала проверяем состояние ожидания
+  def handle_info(:connect, %{status: :waiting_for_mount} = state) do
+    Logger.debug("MountWorker in waiting_for_mount state, ignoring connect")
+    {:noreply, state}
+  end
+
   def handle_info(:connect, %{connected: false} = state) do
     opts = [baud_rate: state.baud_rate, parity: :none, stop_bits: 1, data_bits: 8, active: true]
     case Circuits.UART.open(state.uart_pid, state.port_name, opts) do
@@ -468,7 +518,7 @@ defmodule SolarObservations.Workers.MountWorker do
   @impl true
   def handle_info(:correct_dec, state) do
     result =
-      with {:ok, sun}  <- get_sun_position(),
+      with {:ok, sun} <- do_calculate_sun_position(state),
            {:ok, cpr}  <- resolve_or_fetch(:cpr, state.last_cpr),
            {:ok, pos2} <- get_position("2") do
         target = Pointing.calculate_dec_steps(sun, cpr)
@@ -561,6 +611,12 @@ defmodule SolarObservations.Workers.MountWorker do
     {:noreply, reconnect(state)}
   end
 
+  def handle_info(:check_active_mount, state) do
+    new_state = check_and_update_active_mount(state)
+    schedule_mount_check()
+    {:noreply, new_state}
+  end
+
   # ===========================================================================
   # Private: UART / очередь
   # ===========================================================================
@@ -638,18 +694,27 @@ defmodule SolarObservations.Workers.MountWorker do
   defp handle_command_result(state, :init_mount, _cmd, {:ok, _}) do
     Logger.info("✓ Mount initialized — starting connection monitoring")
     if state.connection_monitor_ref, do: Process.cancel_timer(state.connection_monitor_ref)
-    ref   = schedule_connection_check(state.connection_check_interval)
-    state = %{state | mount_initialized: true, connection_monitor_ref: ref}
+    ref = schedule_connection_check(state.connection_check_interval)
+    state = %{state | mount_initialized: true, connection_monitor_ref: ref, status: :connected}
+
+    if state.active_mount_id do
+      Task.start(fn ->
+        mount = SolarObservations.Repo.get(SolarObservations.Mount, state.active_mount_id)
+        if mount do
+          SolarObservations.Mount.changeset(mount, %{initialized: true})
+          |> SolarObservations.Repo.update()
+        end
+      end)
+    end
+
     cond do
       state.return_home_pending ->
         send(self(), :return_home_after_reconnect)
         %{state | return_home_pending: false}
-
       state.active_activity != nil ->
         Logger.info("Restoring activity after reconnect: #{inspect(state.active_activity)}")
         send(self(), :restore_activity)
         state
-
       true ->
         send(self(), :save_home_position)
         state
@@ -742,23 +807,30 @@ defmodule SolarObservations.Workers.MountWorker do
   # ===========================================================================
 
   defp do_goto_sun(timeout) do
-    with {:ok, _sun} <- get_sun_position(),
+    # TODO: проверить логи чтобы мы получали активнуб монтировку
+    # И тестит наведение поле этого
+    with {:ok, active_mount} <- get_active_mount(),
+         {:ok, _sun} <- get_sun_position(),
          {:ok, cpr}  <- get_cpr("1"),
          {:ok, tmr}  <- get_timer_freq(),
          :ok         <- instant_stop("3"),
          _           <- Process.sleep(300),
-         # Возврат в HOME через безопасный chunked GOTO
          :ok         <- do_goto_safe("1", 0),
          :ok         <- do_goto_safe("2", 0),
          :ok         <- wait_for_stop("1", 60_000),
          :ok         <- wait_for_stop("2", 60_000),
          :ok         <- instant_stop("3"),
          _           <- Process.sleep(500),
-         # Пересчитываем позицию солнца после остановки
          {:ok, sun2} <- get_sun_position() do
+      IO.inspect(active_mount)
 
-      lon = Application.get_env(:solar_observations, :observer_longitude)
+      lon = Decimal.to_float(active_mount.longitude)
       lst = Pointing.calculate_lst(DateTime.utc_now(), lon)
+      IO.inspect("----------------------------------")
+
+      IO.inspect(lon)
+      IO.inspect(lst)
+
       {:ok, {axis1_steps, axis2_steps}} = Pointing.calculate_goto_steps(sun2, lst, cpr)
       chunk_steps = round(@chunk_degrees * cpr / 360.0)
 
@@ -774,16 +846,14 @@ defmodule SolarObservations.Workers.MountWorker do
       └──────────────────────────────────────
       """)
 
-      # Наводка через chunked GOTO — оба канала параллельно не можем
-      # (один UART), поэтому последовательно: сначала RA, потом Dec
       with :ok <- do_goto_chunked_and_wait(channel: "1", target: axis1_steps,
-                                            cpr: cpr, chunk_steps: chunk_steps,
-                                            timeout: timeout),
-           :ok <- do_goto_chunked_and_wait(channel: "2", target: axis2_steps,
-                                            cpr: cpr, chunk_steps: chunk_steps,
-                                            timeout: timeout),
-           :ok <- instant_stop("3"),
-           _   <- Process.sleep(300) do
+                                          cpr: cpr, chunk_steps: chunk_steps,
+                                          timeout: timeout),
+          :ok <- do_goto_chunked_and_wait(channel: "2", target: axis2_steps,
+                                          cpr: cpr, chunk_steps: chunk_steps,
+                                          timeout: timeout),
+          :ok <- instant_stop("3"),
+          _   <- Process.sleep(300) do
         Logger.info("✓ GOTO Sun complete — starting tracking")
         start_solar_tracking(cpr, tmr)
       end
@@ -843,7 +913,7 @@ defmodule SolarObservations.Workers.MountWorker do
 
   # Простой GOTO без чанков — только для небольших смещений где переполнение невозможно
   # (используется в Dec-коррекции и stop_and_return_home через do_goto_safe).
-  defp do_goto(channel, target_steps) do
+  def do_goto(channel, target_steps) do
     with :ok <- set_motion_mode(channel, 0x0, Pointing.direction_db2(target_steps)),
          :ok <- set_goto_target(channel, target_steps),
          :ok <- start_motion(channel) do
@@ -854,7 +924,7 @@ defmodule SolarObservations.Workers.MountWorker do
 
   # Безопасный GOTO с автоматическим chunked-разбиением.
   # Использовать везде где target может быть большим (HOME, goto_sun).
-  defp do_goto_safe(channel, target_steps) do
+  def do_goto_safe(channel, target_steps) do
     with {:ok, cpr}      <- get_cpr("1"),
          {:ok, curr_pos} <- get_position(channel) do
       remaining   = target_steps - curr_pos
@@ -863,6 +933,91 @@ defmodule SolarObservations.Workers.MountWorker do
         {:ok, _} -> :ok
         error    -> error
       end
+    end
+  end
+
+  # ===========================================================================
+  # Private: работа с активной монтировкой
+  # ===========================================================================
+
+  defp schedule_mount_check do
+    Process.send_after(self(), :check_active_mount, @mount_check_interval)
+  end
+
+  defp check_and_update_active_mount(state) do
+    # ИСПРАВЛЕННЫЙ СИНТАКСИС from
+    active_mount = Repo.get_by(Mount, active: true)
+      cond do
+      is_nil(active_mount) and state.active_mount_id == nil ->
+        Logger.debug("No active mount found, waiting...")
+        state
+
+      is_nil(active_mount) and state.active_mount_id != nil ->
+        Logger.warning("Active mount removed, disconnecting...")
+        disconnect(state)
+
+      not is_nil(active_mount) and state.active_mount_id == nil ->
+        Logger.info("Active mount found: #{active_mount.name}")
+        mount_state = %{state | active_mount_id: active_mount.id,
+                                 port_name: active_mount.port,
+                                 baud_rate: active_mount.baud_rate,
+                                 latitude: active_mount.latitude,
+                                 longitude: active_mount.longitude,
+                                 status: :connecting}
+        send(self(), :connect)
+        mount_state
+
+      not is_nil(active_mount) and state.active_mount_id == active_mount.id ->
+        if state.port_name != active_mount.port or
+           state.baud_rate != active_mount.baud_rate or
+           state.latitude != active_mount.latitude or
+           state.longitude != active_mount.longitude do
+          Logger.info("Active mount changed: #{active_mount.name}, reconnecting...")
+          state = disconnect(state)
+          %{state | active_mount_id: active_mount.id,
+                    port_name: active_mount.port,
+                    baud_rate: active_mount.baud_rate,
+                    latitude: active_mount.latitude,
+                    longitude: active_mount.longitude,
+                    status: :connecting}
+          |> then(fn s -> send(self(), :connect); s end)
+        else
+          state
+        end
+
+      true ->
+        Logger.info("Switching active mount to #{active_mount.name}")
+        state = disconnect(state)
+        %{state | active_mount_id: active_mount.id,
+                  port_name: active_mount.port,
+                  baud_rate: active_mount.baud_rate,
+                  latitude: active_mount.latitude,
+                  longitude: active_mount.longitude,
+                  status: :connecting}
+        |> then(fn s -> send(self(), :connect); s end)
+    end
+  end
+
+  defp disconnect(state) do
+    if state.connected do
+      if state.dec_correction_ref, do: Process.cancel_timer(state.dec_correction_ref)
+      Circuits.UART.close(state.uart_pid)
+      Logger.info("Disconnected from mount")
+    end
+    %{state | connected: false, mount_initialized: false, status: :waiting_for_mount,
+               return_home_pending: true, current_request: nil, request_queue: [],
+               response_buffer: "", consecutive_timeouts: 0, dec_correction_ref: nil}
+  end
+
+  defp do_calculate_sun_position(state) do
+    case {state.latitude, state.longitude} do
+      {lat, lon} when not is_nil(lat) and not is_nil(lon) ->
+        now = DateTime.utc_now()
+        lat_float = Decimal.to_float(lat)
+        lon_float = Decimal.to_float(lon)
+        {:ok, Pointing.calculate_sun_position(now, lat_float, lon_float)}
+      _ ->
+        {:error, :mount_not_ready}
     end
   end
 

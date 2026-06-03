@@ -12,10 +12,15 @@ defmodule SolarObservations.Application do
       SolarObservations.Repo,
       {DNSCluster, query: Application.get_env(:solar_observations, :dns_cluster_query) || :ignore},
 
-      {SolarObservations.Workers.MountWorker,
-       Application.get_env(:solar_observations, SolarObservations.Workers.MountWorker)},
-
       {Phoenix.PubSub, name: SolarObservations.PubSub},
+
+      {SolarObservations.Workers.Mount.MountWorker,
+       Application.get_env(:solar_observations, SolarObservations.Workers.Mount.MountWorker)},
+
+      {SolarObservations.Workers.Camera.CameraWorker,
+        Application.get_env(:solar_observations, SolarObservations.Workers.Camera.CameraWorker)},
+
+
       SolarObservationsWeb.Endpoint
     ]
 

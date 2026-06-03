@@ -21,6 +21,9 @@ defmodule SolarObservations.Repo.Migrations.CreateMounts do
       add :reconnect_interval, :integer, default: 5000
 
       add :initialized,      :boolean, default: false
+
+      add :active, :boolean, default: false, null: false
+
       timestamps()
     end
 

@@ -1,6 +1,6 @@
 # MountWorker — шпаргалка для тестирования в iex
 
-alias SolarObservations.Workers.MountWorker, as: W
+alias SolarObservations.Workers.Mount.MountWorker, as: W
 
 
 ## Диагностика

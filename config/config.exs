@@ -57,6 +57,7 @@ config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id]
 
+
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
@@ -64,7 +65,11 @@ config :phoenix, :json_library, Jason
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"
 
-config :solar_observations, SolarObservations.Workers.MountControllerWorker,
+config :solar_observations, SolarObservations.Workers.Mount.MountWorker,
   port_name: "/dev/ttyUSB0",
   baud_rate: 9600,
   reconnect_interval: 5000
+
+config :solar_observations, SolarObservations.Workers.Camera.CameraWorker,
+  port_path: "/usr/local/bin/asi_port",
+  reconnect_interval: 5_000

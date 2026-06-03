@@ -1,4 +1,4 @@
-defmodule SolarObservations.Workers.Utils.Pointing do
+defmodule SolarObservations.Workers.Mount.Utils.Pointing do
   @moduledoc """
   Математика наводки монтировки на Солнце.
 

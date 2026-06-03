@@ -56,7 +56,8 @@ defmodule SolarObservationsWeb.MountJSON do
       reconnect_interval: mount.reconnect_interval,
       initialized: mount.initialized,
       inserted_at: mount.inserted_at,
-      updated_at: mount.updated_at
+      updated_at: mount.updated_at,
+      active: mount.active
     }
   end
 

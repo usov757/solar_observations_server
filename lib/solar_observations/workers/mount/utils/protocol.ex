@@ -1,4 +1,4 @@
-defmodule SolarObservations.Workers.Utils.Protocol do
+defmodule SolarObservations.Workers.Mount.Utils.Protocol do
   @moduledoc """
   Кодирование и декодирование протокола SkyWatcher Motor Controller.
 

@@ -20,47 +20,94 @@ defmodule SolarObservationsWeb.Router do
     get "/", PageController, :home
   end
 
-  # Other scopes may use custom stacks.
   scope "/api", SolarObservationsWeb do
     pipe_through :api
 
+    # -------------------------------------------------------------------------
     # Mounts
+    # -------------------------------------------------------------------------
     resources "/mounts", MountController, except: [:new, :edit] do
-      get "/status", MountController, :status
-      post "/goto_sun", MountController, :goto_sun
+      # Статус и диагностика
+      get  "/status",       MountController, :status
+      get  "/sun_position", MountController, :sun_position
+      get  "/axis_status",  MountController, :axis_status
+      get  "/position",     MountController, :position
+
+      # Новый: читает cpr, timer_freq, firmware с контроллера
+      get  "/params",       MountController, :params
+
+      # Управление движением
+      post "/initialize",    MountController, :initialize
+      post "/goto_sun",      MountController, :goto_sun
       post "/start_tracking", MountController, :start_tracking
       post "/stop_tracking", MountController, :stop_tracking
-      post "/sync", MountController, :sync
-      get "/sun_position", MountController, :sun_position
-      post "/initialize", MountController, :initialize
-      get "/axis_status", MountController, :axis_status
-      get "/position", MountController, :position
-      post "/stop", MountController, :stop
-      get "/cameras", CameraController, :by_mount
-      get "/observing_sessions", ObservingSessionController, :by_mount
+      post "/stop",          MountController, :stop
+      post "/sync",          MountController, :sync
+
+      # Новые: тонкое управление
+      post "/goto",          MountController, :goto         # поворот на градусы
+      post "/sleep",         MountController, :sleep        # усыпить/разбудить ось
+      post "/motion_mode",   MountController, :motion_mode  # режим движения
+      post "/step_period",   MountController, :step_period  # период шага
+      post "/start_motion",  MountController, :start_motion # запуск движения
+
+      # Вложенные ресурсы (read-only shortcuts, полный CRUD по /cameras, /observing_sessions)
+      get  "/cameras",             CameraController, :by_mount
+      get  "/observing_sessions",  ObservingSessionController, :by_mount
     end
 
+    # -------------------------------------------------------------------------
     # Cameras
-    resources "/cameras", CameraController, except: [:new, :edit]
+    # -------------------------------------------------------------------------
+    resources "/cameras", CameraController, except: [:new, :edit] do
+      # Статус и телеметрия (проксируют CameraWorker)
+      get    "/status",       CameraController, :status
+      get    "/temperature",  CameraController, :temperature
 
-    # Observing sessions
-    resources "/observing_sessions", ObservingSessionController, except: [:new, :edit] do
-      post "/end", ObservingSessionController, :end_session
-      post "/abort", ObservingSessionController, :abort
-      get "/session_events", SessionEventController, :by_session
+      # Съёмка
+      post   "/capture",      CameraController, :capture      # одиночный кадр → FITS на диск
+
+      # Стриминг
+      post   "/stream/start", CameraController, :stream_start
+      post   "/stream/stop",  CameraController, :stream_stop
+
+      # Охладитель (Пельтье)
+      post   "/cooler",       CameraController, :cooler_on    # включить / задать температуру
+      delete "/cooler",       CameraController, :cooler_off   # отключить
     end
 
-    # Session events
+    # -------------------------------------------------------------------------
+    # Captures (статические FITS-файлы, сохранённые на диске)
+    # GET /api/captures/:filename — отдаёт файл из priv/captures/
+    # -------------------------------------------------------------------------
+    get "/captures/:filename", CaptureController, :show
+
+    # -------------------------------------------------------------------------
+    # Observing Sessions
+    # -------------------------------------------------------------------------
+    resources "/observing_sessions", ObservingSessionController, except: [:new, :edit] do
+      # Жизненный цикл
+      post "/end",   ObservingSessionController, :end_session
+      post "/abort", ObservingSessionController, :abort
+
+      # Новые: оркестрация железа
+      post "/start", ObservingSessionController, :start   # initialize → goto_sun → tracking → stream
+      post "/sync",  ObservingSessionController, :sync    # синк с позицией Солнца
+
+      # События сессии
+      get  "/session_events", SessionEventController, :by_session
+    end
+
+    # -------------------------------------------------------------------------
+    # Session Events
+    # -------------------------------------------------------------------------
     resources "/session_events", SessionEventController, except: [:new, :edit]
   end
 
-  # Enable LiveDashboard and Swoosh mailbox preview in development
+  # ---------------------------------------------------------------------------
+  # Dev tools
+  # ---------------------------------------------------------------------------
   if Application.compile_env(:solar_observations, :dev_routes) do
-    # If you want to use the LiveDashboard in production, you should put
-    # it behind authentication and allow only admins to access it.
-    # If your application does not have an admins-only section yet,
-    # you can use Plug.BasicAuth to set up some basic authentication
-    # as long as you are also using SSL (which you should anyway).
     import Phoenix.LiveDashboard.Router
 
     scope "/dev" do

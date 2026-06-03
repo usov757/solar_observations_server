@@ -31,7 +31,8 @@ default_mount = %Mount{
   reconnect_interval: 5000,
   latitude: Decimal.new("50.2828"),
   longitude: Decimal.new("127.5299"),
-  initialized: false
+  initialized: false,
+  active: true
 }
 
 mount = Repo.insert!(default_mount)
@@ -39,8 +40,8 @@ IO.puts("✓ Created mount: #{mount.name}")
 
 # Создаем тестовую камеру
 camera = %Camera{
-  name: "ASI174MM",
-  device_id: "USB3.0-1.1",
+  name: "ZWO ASI6200MM Pro",
+  device_id: "USB3.0",
   focal_length_mm: Decimal.new("1000.00"),
   default_exposure: Decimal.new("0.001"),
   default_gain: 100,

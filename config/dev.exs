@@ -10,15 +10,15 @@ config :solar_observations, SolarObservations.Repo,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10
 
-
-config :solar_observations,
-  observer_latitude: 50.2828,
-  observer_longitude: 127.5299
-
-config :solar_observations, SolarObservations.Workers.MountWorker,
+config :solar_observations, SolarObservations.Workers.Mount.MountWorker,
   port_name: "/dev/ttyUSB0",
   baud_rate: 9600,
   reconnect_interval: 5000
+
+
+config :solar_observations, SolarObservations.Workers.Camera.CameraWorker,
+  port_path: "/usr/local/bin/asi_port",
+  reconnect_interval: 5_000
 
 # For development, we disable any cache and enable
 # debugging and code reloading.

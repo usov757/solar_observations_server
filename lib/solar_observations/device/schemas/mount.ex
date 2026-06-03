@@ -25,6 +25,7 @@ defmodule SolarObservations.Mount do
     field :baud_rate, :integer, default: 9600
     field :reconnect_interval, :integer, default: 5000
     field :initialized, :boolean, default: false
+    field :active, :boolean, default: false
 
     has_many :cameras, Camera
     has_many :observing_sessions, ObservingSession
@@ -46,9 +47,10 @@ defmodule SolarObservations.Mount do
       :longitude,
       :baud_rate,
       :reconnect_interval,
-      :initialized
+      :initialized,
+      :active
     ])
-    |> validate_required([:name])
+    |> validate_required([:name, :active])
     |> validate_inclusion(:connection_type, ["serial", "ethernet", "usb"])
     |> validate_number(:latitude, greater_than_or_equal_to: -90, less_than_or_equal_to: 90)
     |> validate_number(:longitude, greater_than_or_equal_to: -180, less_than_or_equal_to: 180)
